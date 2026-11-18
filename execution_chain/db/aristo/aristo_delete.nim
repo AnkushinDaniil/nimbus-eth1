@@ -19,7 +19,7 @@ import
   eth/common/hashes,
   results,
   ./aristo_delete/delete_subtree,
-  ./[aristo_desc, aristo_fetch, aristo_get, aristo_hike, aristo_layers]
+  ./[aristo_desc, aristo_fetch, aristo_get, aristo_layers]
 
 # ------------------------------------------------------------------------------
 # Private heplers
@@ -45,7 +45,7 @@ proc branchStillNeeded(vtx: BranchRef, removed: byte): Result[int8, AristoError]
 # Private functions
 # ------------------------------------------------------------------------------
 
-proc deleteImpl(
+proc deleteImpl*(
     db: AristoTxRef;                   # Database, top layer
     hike: Hike;                        # Fully expanded path
       ): Result[VertexRef, AristoError] =
@@ -180,80 +180,6 @@ proc deleteAccount*(
       let sibAccPath =
         Hash32(getBytes(NibblesBuf.fromBytes(accPath.data).replaceSuffix(AccLeafRef(otherVtx).pfx)))
       db.layersPutAccLeaf(sibAccPath, AccLeafRef(otherVtx))
-
-  ok()
-
-proc deleteSlot*(
-    db: AristoTxRef;
-    accPath: Hash32;
-    stoPath: Hash32;
-      ): Result[void,AristoError] =
-  ## For a given account argument `accPath`, this function deletes the
-  ## argument `stoPath` from the associated storage tree (if any, at all.) If
-  ## the if the argument `stoPath` deleted was the last one on the storage tree,
-  ## account leaf referred to by `accPath` will be updated so that it will
-  ## not refer to a storage tree anymore.
-  ##
-
-  let
-    mixPath = mixUp(accPath, stoPath)
-    stoLeaf = db.cachedStoLeaf(mixPath, stoPath)
-
-  if stoLeaf == Opt.some(nil):
-    return ok() # Trying to delete something that doesn't exist is ok
-
-  var accHike: Hike
-  db.fetchAccountHike(accPath, accHike).isOkOr:
-    if error == FetchAccInaccessible:
-      return ok() # Trying to delete something that doesn't exist is ok
-    return err(error)
-
-  let
-    accLeg = accHike.legs[^1]
-    accVtx = AccLeafRef(accLeg.vtx)
-    stoID = accVtx.stoID
-
-  if not stoID.isValid:
-    return ok() # Trying to delete something that doesn't exist is ok
-
-  let stoNibbles = NibblesBuf.fromBytes(stoPath.data)
-  var stoHike: Hike
-  stoNibbles.hikeUp(stoID.vid, db, stoLeaf, stoHike).isOkOr:
-    if error[1] in HikeAcceptableStopsNotFound:
-      return ok()
-    return err(error[1])
-
-  # Mark account path Merkle keys for update - the leaf key is not stored so no
-  # need to mark it
-  db.layersResKeys(accHike, skip = 1)
-
-  let otherVtx = ?db.deleteImpl(stoHike)
-  db.layersPutStoLeaf(mixPath, nil)
-
-  var hint = accVtx.stoHint
-  if otherVtx.isValid:
-    if otherVtx.vType == StoLeaf:
-      let
-        sibStoPath = Hash32(getBytes(stoNibbles.replaceSuffix(StoLeafRef(otherVtx).pfx)))
-        leafMixPath = mixUp(accPath, sibStoPath)
-        sibLevel = 64 - StoLeafRef(otherVtx).pfx.len
-      db.layersPutStoLeaf(leafMixPath, StoLeafRef(otherVtx))
-      # Merging is the only other writer of the hint, so without this a
-      # collapsed trie keeps probing the levels the deleted leaves occupied
-      if 0 < hint:
-        hint = min(hint, uint8(min(sibLevel, STATIC_VID_LEVELS) + 1))
-
-  # If there was only one item (that got deleted), update the account as well
-  if stoHike.legs.len == 1:
-    # De-register the deleted storage tree from the account record
-    let leaf = db.layersUpdate((accHike.root, accLeg.vid), accVtx) # Dup on modify
-    leaf.stoID.isValid = false
-    leaf.stoHint = 0
-    db.layersPutAccLeaf(accPath, leaf)
-  elif hint != accVtx.stoHint:
-    let leaf = db.layersUpdate((accHike.root, accLeg.vid), accVtx) # Dup on modify
-    leaf.stoHint = hint
-    db.layersPutAccLeaf(accPath, leaf)
 
   ok()
 

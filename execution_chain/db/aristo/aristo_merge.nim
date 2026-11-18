@@ -29,7 +29,10 @@ import
   eth/common/hashes,
   results,
   ./aristo_delete/delete_subtree,
-  ./[aristo_desc, aristo_fetch, aristo_get, aristo_layers, aristo_serialise, aristo_vid]
+  ./[
+    aristo_delete, aristo_desc, aristo_fetch, aristo_get, aristo_hike, aristo_layers,
+    aristo_serialise, aristo_vid,
+  ]
 
 proc layersPutLeaf[T](
     db: AristoTxRef, rvid: RootedVertexID, path: NibblesBuf, payload: T
@@ -298,83 +301,154 @@ proc mergeAccount*(
 
   ok true
 
-proc mergeSlot*(
-    db: AristoTxRef;                   # Database, top layer
-    accPath: Hash32;                   # Needed for accounts payload
-    stoPath: Hash32;                   # Storage data path (aka key)
-    stoData: UInt256;                  # Storage data payload value
-      ): Result[void,AristoError] =
+proc mergeSlots*(
+    db: AristoTxRef, accPath: Hash32, slots: varargs[(Hash32, UInt256)]
+): Result[void, AristoError] =
   ## Store the `stoData` data argument on the storage area addressed by
   ## `(accPath,stoPath)` where `accPath` is the account key (into the MPT)
   ## and `stoPath`  is the slot path of the corresponding storage area.
   ##
   var accHike: Hike
-  db.fetchAccountHike(accPath,accHike).isOkOr:
+  db.fetchAccountHike(accPath, accHike).isOkOr:
     return err(MergeStoAccMissing)
 
-  let
-    accVtx = AccLeafRef(accHike.legs[^1].vtx)
+  let accVtx = AccLeafRef(accHike.legs[^1].vtx)
+
+  var
     stoID = accVtx.stoID
+    stoHint = accVtx.stoHint
 
-    # Provide new storage ID when needed
-    useID =
-      if stoID.isValid: stoID                     # Use as is
-      elif stoID.vid.isValid: (true, stoID.vid)   # Re-use previous vid
-      else: (true, db.vidFetch())                 # Create new vid
-    mixPath = mixUp(accPath, stoPath)
-    stoStatic = not stoID.isValid or 0 < accVtx.stoHint
-    # Call merge
-    updated = db.mergePayloadImpl(
-      useID.vid,
-      stoPath,
-      db.cachedStoLeaf(mixPath, stoPath),
-      stoData,
-      stoStatic = stoStatic,
-    ).valueOr:
-      if error == MergeNoAction:
-        assert stoID.isValid         # debugging only
-        return ok()
+  var merged = false
 
-      return err(error)
+  for v in slots:
+    template stoPath(): untyped =
+      v[0]
+
+    template stoData(): untyped =
+      v[1]
+
+    let isDelete = stoData.isZero()
+    if isDelete and not stoID.isValid:
+      continue # No change
+
+    let
+      mixPath = mixUp(accPath, stoPath)
+      stoStatic = not stoID.isValid or 0 < stoHint
+      stoLeaf = db.cachedStoLeaf(mixPath, stoPath)
+
+    if (isDelete and stoLeaf == Opt.some(nil)) or (
+      not isDelete and stoLeaf.isSome() and stoLeaf[] != nil and
+      stoLeaf[].stoData == stoData
+    ):
+      continue # No change
+
+    if isDelete:
+      let stoNibbles = NibblesBuf.fromBytes(stoPath.data)
+      var stoHike: Hike
+
+      stoNibbles.hikeUp(stoID.vid, db, stoLeaf, stoHike).isOkOr:
+        if error[1] in HikeAcceptableStopsNotFound:
+          continue # Not found
+        return err(error[1])
+
+      let otherVtx = ?db.deleteImpl(stoHike)
+      db.layersPutStoLeaf(mixPath, nil)
+
+      merged = true
+
+      if otherVtx.isValid:
+        if otherVtx.vType == StoLeaf:
+          let
+            sibStoPath =
+              Hash32(getBytes(stoNibbles.replaceSuffix(StoLeafRef(otherVtx).pfx)))
+            leafMixPath = mixUp(accPath, sibStoPath)
+            sibLevel = 64 - StoLeafRef(otherVtx).pfx.len
+          db.layersPutStoLeaf(leafMixPath, StoLeafRef(otherVtx))
+          # Merging is the only other writer of the hint, so without this a
+          # collapsed trie keeps probing the levels the deleted leaves occupied
+          if 0 < stoHint:
+            stoHint = min(stoHint, uint8(min(sibLevel, STATIC_VID_LEVELS) + 1))
+
+      # If there was only one item (that got deleted), update the account as well
+      if stoHike.legs.len == 1:
+        # De-register the deleted storage tree from the account record
+        stoID.isValid = false
+    else:
+      # Provide new storage ID when needed
+      let useID =
+        if stoID.isValid:
+          stoID # Use as is
+        elif stoID.vid.isValid:
+          (true, stoID.vid) # Re-use previous vid
+        else:
+          (true, db.vidFetch()) # Create new vid
+
+      let updated = db.mergePayloadImpl(
+        useID.vid, stoPath, stoLeaf, stoData, stoStatic = stoStatic
+      ).valueOr:
+        if error == MergeNoAction:
+          continue # No change
+
+        return err(error)
+
+      merged = true
+
+      # Update leaf cache both of the merged value and potentially the displaced
+      # leaf resulting from splitting a leaf into a branch with two leaves
+      db.layersPutStoLeaf(mixPath, updated[0])
+
+      if updated[1].isValid:
+        let otherPath = Hash32(
+          getBytes(NibblesBuf.fromBytes(stoPath.data).replaceSuffix(updated[1].pfx))
+        )
+        db.layersPutStoLeaf(mixUp(accPath, otherPath), updated[2])
+
+      # A hint below the leaves costs a negative lookup per level, one above lands
+      # on a branch that the walk resolves from, so bias it shallow: follow a
+      # shallower placement at once, a deeper one only when it clears hint by two.
+      stoHint =
+        if not stoStatic:
+          0'u8
+        elif 0 <= updated[3]:
+          let placed = uint8(min(updated[3], STATIC_VID_LEVELS) + 1)
+          if placed < stoHint or stoHint == 0:
+            placed
+          elif placed > stoHint + 1:
+            placed - 1
+          else:
+            stoHint
+        else:
+          stoHint
+      stoID = useID
+
+  if not merged:
+    return ok() # TODO noaction
 
   # Mark account path Merkle keys for update - the leaf key is not stored so no
   # need to mark it
   db.layersResKeys(accHike, skip = 1)
 
-  # Update leaf cache both of the merged value and potentially the displaced
-  # leaf resulting from splitting a leaf into a branch with two leaves
-  db.layersPutStoLeaf(mixPath, updated[0])
-
-  if updated[1].isValid:
-    let otherPath =
-      Hash32(getBytes(NibblesBuf.fromBytes(stoPath.data).replaceSuffix(updated[1].pfx)))
-    db.layersPutStoLeaf(mixUp(accPath, otherPath), updated[2])
-
-  # A hint below the leaves costs a negative lookup per level, one above lands
-  # on a branch that the walk resolves from, so bias it shallow: follow a
-  # shallower placement at once, a deeper one only when it clears hint by two.
-  let hint =
-    if not stoStatic:
-      0'u8
-    elif 0 <= updated[3]:
-      let placed = uint8(min(updated[3], STATIC_VID_LEVELS) + 1)
-      if placed < accVtx.stoHint or accVtx.stoHint == 0:
-        placed
-      elif placed > accVtx.stoHint + 1:
-        placed - 1
-      else:
-        accVtx.stoHint
-    else:
-      accVtx.stoHint
-  if not stoID.isValid or accVtx.stoHint != hint:
+  if accVtx.stoID != stoID or accVtx.stoHint != stoHint:
     # Make sure that there is an account that refers to that storage trie and
     # remembers where to start probing for its leaves
-    let leaf = db.layersUpdate((STATE_ROOT_VID, accHike.legs[^1].vid), accVtx) # Dup on modify
-    leaf.stoID = useID
-    leaf.stoHint = hint
+    let leaf = db.layersUpdate((STATE_ROOT_VID, accHike.legs[^1].vid), accVtx)
+    leaf.stoID = stoID
+    leaf.stoHint = stoHint
     db.layersPutAccLeaf(accPath, leaf)
 
   ok()
+
+proc mergeSlot*(
+    db: AristoTxRef, # Database, top layer
+    accPath: Hash32, # Needed for accounts payload
+    stoPath: Hash32, # Storage data path (aka key)
+    stoData: UInt256, # Storage data payload value
+): Result[void, AristoError] =
+  ## Store the `stoData` data argument on the storage area addressed by
+  ## `(accPath,stoPath)` where `accPath` is the account key (into the MPT)
+  ## and `stoPath`  is the slot path of the corresponding storage area.
+  ##
+  db.mergeSlots(accPath, (stoPath, stoData))
 
 # ------------------------------------------------------------------------------
 # End
